@@ -11,9 +11,8 @@ import torch.nn.functional as F
 import torch.nn.parallel
 import torch.optim
 
-from dataloader.AnoFundusLoader import AnoDRIVE_Loader, AnoIDRID_Loader
-from dataloader.fundus_cls_dataloader import NewClsFundusDataloader
-from dataloader.OCT_DataLoader import ChengOCTloader, ChallengeOCTloader
+from datasets import SegmentationImageDataset
+from datasets import ImageDataset
 from networks.unet import UNet_4mp
 from networks.discriminator import Discriminator
 from utils.gan_loss import AdversarialLoss
@@ -30,6 +29,10 @@ class SegTransferModel(nn.Module):
         # n_classes for OCT: 12
         self.args = args
         assert args.data_modality in ['oct', 'fundus'], 'error in seg_mode, got {}'.format(args.data_modality)
+        if args.gpu >= 0:
+            device = torch.device('cuda', args.gpu)
+        else:
+            device = torch.device('cpu')
 
         # model on gpu
         if self.args.data_modality == 'fundus':
@@ -38,12 +41,12 @@ class SegTransferModel(nn.Module):
             model_G = UNet_4mp(n_channels=1, n_classes=12)
         model_D = Discriminator(in_channels=1)
 
-        model_G = nn.DataParallel(model_G).cuda()
-        model_D = nn.DataParallel(model_D).cuda()
+        model_G = nn.DataParallel(model_G).to(device)
+        model_D = nn.DataParallel(model_D).to(device)
 
-        l1_loss = nn.L1Loss().cuda()
-        nll_loss = nn.NLLLoss().cuda()
-        adversarial_loss = AdversarialLoss().cuda()
+        l1_loss = nn.L1Loss().to(device)
+        nll_loss = nn.NLLLoss().to(device)
+        adversarial_loss = AdversarialLoss().to(device)
 
         self.add_module('model_G', model_G)
         self.add_module('model_D', model_D)
@@ -76,7 +79,7 @@ class SegTransferModel(nn.Module):
             else:
                 raise ValueError("=> no checkpoint found at '{}'".format(args.resume))
 
-    def process(self, image_source, mask_source_gt, image_target):
+    def process(self, image_source, mask_source_gt):
         # ---------------
         #  Source Domain
         # ---------------
@@ -107,51 +110,12 @@ class SegTransferModel(nn.Module):
         # backward
         self.backward(gen_loss=seg_loss)
 
-        # ---------------
-        #  Target Domain
-        # ---------------
-        # zero optimizers
-        self.optimizer_G.zero_grad()
-        self.optimizer_D.zero_grad()
-
-        # process_outputs
-        output_target_mask = self(image_target)
-        gen_loss = 0
-        dis_loss = 0
-
-        if self.args.data_modality == 'oct':
-            # BCWH -> BWH
-            _, output_target_mask = torch.max(output_target_mask, dim=1)
-            # BWH -> B1WH
-            output_target_mask = output_target_mask.float().unsqueeze(dim=1)
-
-        # discriminator loss
-        dis_input_real = output_source_mask.detach()
-        dis_input_fake = output_target_mask.detach()
-        dis_real, dis_real_feat = self.model_D(dis_input_real)
-        dis_fake, dis_fake_feat = self.model_D(dis_input_fake)
-        dis_real_loss = self.adversarial_loss(dis_real, True)
-        dis_fake_loss = self.adversarial_loss(dis_fake, False)
-        dis_loss += (dis_real_loss + dis_fake_loss) / 2
-
-        # generator adversarial loss
-        gen_input_fake = output_target_mask
-        gen_fake, gen_fake_feat = self.model_D(gen_input_fake)
-        gen_gan_loss = self.adversarial_loss(gen_fake, True) * self.args.lamd_gen
-        gen_loss += gen_gan_loss
-
-        # backward
-        self.backward(gen_loss=gen_loss, dis_loss=dis_loss)
-
         # create logs
         logs = dict(
             seg_loss=seg_loss,
-            gen_loss=gen_loss,
-            gen_gan_loss=gen_gan_loss,
-            dis_loss=dis_loss,
         )
 
-        return output_source_mask, output_target_mask, logs
+        return output_source_mask, logs
 
     def forward(self, image):
         output_mask = self.model_G(image)
@@ -170,36 +134,28 @@ class SegTransferModel(nn.Module):
 class RunMyModel(object):
     def __init__(self):
         args = ParserArgs().get_args()
-        cuda_visible(args.gpu)
-
-        cudnn.benchmark = True
+        if not os.path.exists(args.output_root):
+            os.makedirs(args.output_root)
+        if args.gpu >= 0:
+            torch.cuda.set_device(args.gpu)
+            self.device = torch.device('cuda', args.gpu)
+            cudnn.benchmark = True
+        else:
+            self.device = torch.device('cpu')
 
         self.vis = Visualizer(env='{}'.format(args.version), port=args.port, server=args.vis_server)
-
-        if args.data_modality == 'fundus':
-            self.source_loader = AnoDRIVE_Loader(data_root=args.fundus_data_root,
-                                                 batch=args.batch,
-                                                 scale=args.scale,
-                                                 pre=True       # pre-process
-                                                 ).data_load()
-            # self.target_loader, _ = AnoIDRID_Loader(data_root=args.fundus_data_root,
-            #                                      batch=args.batch,
-            #                                      scale=args.scale,
-            #                                     pre=True).data_load()
-            self.target_loader = NewClsFundusDataloader(data_root=args.isee_fundus_root,
-                                                 batch=args.batch,
-                                                 scale=args.scale).load_for_seg()
-
+        # TODO pass resize and crop size
+        train_dataset = SegmentationImageDataset(args.label_path, args.image_root, augment=True,
+                                                 resize_size=(256, 256), crop_size=(224, 224))
+        self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch, shuffle=True,
+                                                        num_workers=1, pin_memory=True)
+        if args.valid_label is not None:
+            valid_dataset = ImageDataset(args.valid_label, args.image_root, augment=False,
+                                         resize_size=(256, 256), crop_size=None)
+            self.valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=args.batch, shuffle=False,
+                                                            num_workers=1, pin_memory=True)
         else:
-            self.source_loader = ChengOCTloader(data_root=args.cheng_oct,
-                                                batch=args.batch,
-                                                scale=args.scale,
-                                                flip=args.flip,
-                                                rotate=args.rotate,
-                                                enhance_p=args.enhance_p).data_load()
-            self.target_loader, _ = ChallengeOCTloader(data_root=args.challenge_oct,
-                                                batch=args.batch,
-                                                scale=args.scale).data_load()
+            self.valid_loader = None
 
         print_args(args)
         self.args = args
@@ -207,7 +163,8 @@ class RunMyModel(object):
         self.model = SegTransferModel(args)
 
         if args.predict:
-            self.validate_loader(self.target_loader)
+            # TODO change name
+            self.predict_(self.valid_loader)
         else:
             self.train_validate()
 
@@ -220,14 +177,10 @@ class RunMyModel(object):
             self.epoch = epoch
 
             self.train()
-            if epoch % self.args.validate_freq == 0 and epoch > self.args.save_freq:
+            if self.valid_loader is not None and epoch % self.args.validate_freq == 0 and epoch > self.args.save_freq:
                 self.validate()
-                # self.validate_loader(self.normal_test_loader)
-                # self.validate_loader(self.amd_fundus_loader)
-                # self.validate_loader(self.myopia_fundus_loader)
 
             print('\n', '*' * 10, 'Program Information', '*' * 10)
-            print('Node: {}'.format(self.args.node))
             print('GPU: {}'.format(self.args.gpu))
             print('Version: {}\n'.format(self.args.version))
 
@@ -236,89 +189,54 @@ class RunMyModel(object):
 
         prev_time = time.time()
 
-        target_loader_iter = self.target_loader.__iter__()
-        # target_loader_isee_iter = self.target_loader.__iter__()
-        for i, (image_source, mask_source_gt, _) in enumerate(self.source_loader):
-            mask_source_gt = mask_source_gt.cuda(non_blocking=True)
-            image_source = image_source.cuda(non_blocking=True).float()
+        for i, (image_source, mask_source_gt, _) in enumerate(self.train_loader):
+            mask_source_gt = mask_source_gt.to(self.device)
+            image_source = image_source.to(self.device)
 
-            image_target, _ = next(target_loader_iter)
-            image_target = image_target.cuda(non_blocking=True)
-            output_source_mask, output_target_mask, logs = \
-                self.model.process(image_source, mask_source_gt, image_target)
+            output_source_mask, logs = self.model.process(image_source, mask_source_gt)
 
-            # if self.epoch % 2 == 0:
-            #     # train on IDRiD dataset
-            #     image_target, _, _ = next(target_loader_iter)
-            #     image_target = image_target.cuda(non_blocking=True)
-            #     output_source_mask, output_target_mask, logs = \
-            #         self.model.process(image_source, mask_source_gt, image_target)
-            # else:
-            #     # train on iSee dataset
-            #     image_target, _, = next(target_loader_isee_iter)
-            #     image_target = image_target.cuda(non_blocking=True)
-            #     output_source_mask, output_target_mask, logs = \
-            #         self.model.process(image_source, mask_source_gt, image_target)
-
-            # --------------
-            #  Log Progress
-            # --------------
+            # Log Progress
             # Determine approximate time left
-            batches_done = self.epoch * self.source_loader.__len__() + i
-            batches_left = self.args.n_epochs * self.source_loader.__len__() - batches_done
+            batches_done = self.epoch * self.train_loader.__len__() + i
+            batches_left = self.args.n_epochs * self.train_loader.__len__() - batches_done
             time_left = datetime.timedelta(seconds=batches_left * (time.time() - prev_time))
             prev_time = time.time()
 
             # Print log
-            sys.stdout.write("\r[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f] ETA: %s" %
-                             (self.epoch, self.args.n_epochs,
-                              i, self.source_loader.__len__(),
-                              logs['dis_loss'].item(),
-                              logs['gen_loss'].item(),
-                              time_left))
+            sys.stdout.write('\r[Epoch {}/{}] [Batch {}/{}] [G loss: {}] ETA: {}'.format(
+                self.epoch, self.args.n_epochs, i, len(self.train_loader), logs['seg_loss'], time_left,
+            ))
 
             # --------------
             #  Visdom
             # --------------
-            if i % self.args.vis_freq == 0:
+            if (i + 1) % self.args.vis_freq == 0:
                 image_source = image_source[:self.args.vis_batch]
-                image_target = image_target[:self.args.vis_batch]
                 if self.args.data_modality == 'oct':
                     # OCT: {0, 1, ..., 11}, BWH
                     # BWH -> B1WH,
                     mask_source_gt = mask_source_gt[:self.args.vis_batch].unsqueeze(dim=1) / 11
                     # B1WH
                     output_source_mask = torch.clamp(output_source_mask[:self.args.vis_batch] / 11, 0, 1)
-                    output_target_mask = torch.clamp(output_target_mask[:self.args.vis_batch] / 11, 0, 1)
                 else:
                     # fundus: {0, 1}, B1WH
                     mask_source_gt = mask_source_gt[:self.args.vis_batch]
                     output_source_mask = torch.clamp(output_source_mask[:self.args.vis_batch], 0, 1)
-                    output_target_mask = torch.clamp(output_target_mask[:self.args.vis_batch], 0, 1)
 
                 vim_images = torch.cat([image_source,
                                         mask_source_gt,
-                                        output_source_mask,
-                                        image_target,
-                                        output_target_mask], dim=0)
+                                        output_source_mask], dim=0)
                 self.vis.images(vim_images, win_name='train', nrow=self.args.vis_batch)
 
-            if i+1 == self.source_loader.__len__():
-                self.vis.plot_multi_win(dict(dis_loss=logs['dis_loss'].item(),
-                                             seg_loss=logs['seg_loss'].item(),
+            if i + 1 == self.train_loader.__len__():
+                self.vis.plot_multi_win(dict(seg_loss=logs['seg_loss'].item(),
                                              lr=self.new_lr))
-                self.vis.plot_single_win(dict(gen_loss=logs['gen_loss'].item(),
-                                              gen_fm_loss=logs['gen_fm_loss'].item(),
-                                              gen_gan_loss=logs['gen_gan_loss'].item(),
-                                              gen_content_loss=logs['gen_content_loss'].item(),
-                                              gen_style_loss=logs['gen_style_loss'].item()),
-                                              win='gen_loss')
 
     def validate(self):
         self.model.eval()
         with torch.no_grad():
-            for i, (image, _) in enumerate(self.target_loader):
-                image = image.cuda(non_blocking=True).float()
+            for i, (image, _) in enumerate(self.valid_loader):
+                image = image.to(self.device).float()
 
                 # forward
                 output_mask = self.model(image)
@@ -352,8 +270,6 @@ class RunMyModel(object):
                     tv.utils.save_image(save_images, os.path.join(output_save, '{}.png'.format(i)),
                                         nrow=self.args.vis_batch)
 
-                    # print('val: [Batch {}/{}]'.format(i, self.target_loader.__len__()))
-
         save_ckpt(version=self.args.version,
                   state={
                       'epoch': self.epoch,
@@ -364,11 +280,12 @@ class RunMyModel(object):
                   args=self.args)
         print('Save ckpt successfully!')
 
-    def validate_loader(self, dataloader):
+    # TODO change name
+    def predict_(self, dataloader):
         self.model.eval()
         with torch.no_grad():
             for i, (image, image_name) in enumerate(dataloader):
-                image = image.cuda(non_blocking=True).float()
+                image = image.to(self.device).float()
 
                 # forward
                 output_mask = self.model(image)
@@ -407,8 +324,8 @@ class RunMyModel(object):
     def predict(self):
         self.model.eval()
         with torch.no_grad():
-            for i, (image, _, item_name) in enumerate(self.target_loader):
-                image = image.cuda(non_blocking=True).float()
+            for i, (image, _, item_name) in enumerate(self.valid_loader):
+                image = image.to(self.device).float()
 
                 if self.args.batch == 1:
                     if self.args.data_modality == 'oct':
@@ -446,7 +363,7 @@ class RunMyModel(object):
                         crf_mask = dense_crf(np.array(_image).astype(np.uint8), mask)
                         _crf_mask = torch.Tensor(crf_mask.astype(np.float)) / 11
                         # HW -> BCHW
-                        _crf_mask = _crf_mask.expand((1, 1, -1, -1)).cuda()
+                        _crf_mask = _crf_mask.expand((1, 1, -1, -1)).to(self.device)
                     else:
                         _crf_mask = output_mask
 

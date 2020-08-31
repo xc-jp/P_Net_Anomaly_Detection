@@ -11,6 +11,10 @@ class ParserArgs(object):
         )
 
         # self.parser addition
+        self.parser.add_argument('image_root', help='Image root directory path')
+        self.parser.add_argument('label_path', help='Training label file path')
+        self.parser.add_argument('output_root', help='Output directory path')
+        self.parser.add_argument('--valid_label', default=None, help='Validation label file path')
         self.constant_init()
         self.get_general_parser()
         self.get_data_parser()
@@ -23,12 +27,6 @@ class ParserArgs(object):
         self.get_comparison_exps_args()
 
     def constant_init(self):
-        # path and server
-        self.ai_data_root = '/p300/'
-        self.ws_data_root = '/home/imed/new_disk/'
-        self.ai_output_root = '/p300/outputspace/'
-        self.ws_output_root = '/home/imed/new_disk/workspace/'
-
         # constant
         self.parser.add_argument('--project', default='P-Net',
                             help='project name in workspace')
@@ -42,17 +40,16 @@ class ParserArgs(object):
         self.parser.add_argument('--version', default='v99_debug',
                                  help='the version of different method/setting/parameters etc')
         self.parser.add_argument('--resume', default='', type=str, metavar='PATH',
-                            help='path to latest checkpoint (format: version/path.tar)')
+                                 help='path to latest checkpoint (format: version/path.tar)')
         self.parser.add_argument('--predict', action='store_true',
-                            help='predict mode, rather than train and val')
+                                 help='predict mode, rather than train and val')
         self.parser.add_argument('--port', default=31430, type=int, help='visdom port')
-        self.parser.add_argument('--gpu', nargs='+', type=int,
-                            help='gpu id for single/multi gpu')
+        self.parser.add_argument('--gpu', '-g', type=int, required=True, help='gpu id')
 
     def get_data_parser(self):
         # dataset
-        self.parser.add_argument('--data_modality', choices=['oct', 'fundus'],
-                            help='the modality of data. No default.')
+        self.parser.add_argument('--data_modality', choices=['oct', 'fundus'], default='fundus',
+                                 help='the modality of data. No default.')
         self.parser.add_argument('--scale', default=224, type=int,
                                  help='image scale (default: 224)')
 
@@ -101,24 +98,8 @@ class ParserArgs(object):
 
     # using this function when define the obeject of the class
     def get_args(self):
-        import socket
         args = self.parser.parse_args()
-        args.node = socket.gethostname()
-
-        ws_name = args.node.split('-')[0]
-        # zhoukang_XX,  zhoukang-XX---------------------------------------------------------------------------------+
-        if ws_name == 'zhoukang' or len(ws_name) > 8:
-           pass
-        else:
-            # imed-007
-            args.server = 'ws'
-            args.cheng_oct = os.path.join(self.ai_data_root, 'imed_dataset/Topcon_Normal_AROD/signal_crop_512')
-            args.challenge_oct = os.path.join(self.ai_data_root, 'eye_dataset/Eye_Public_Dataset/ai_oct_challenge')
-            args.fundus_data_root = os.path.join(self.ws_data_root,
-                                                 'eye_dataset/Eye_Public_Dataset/AnomalyFundusLesion')
-            args.isee_fundus_root = os.path.join(self.ws_data_root, 'imed_dataset/iSee_anomaly/preprocess')
-            args.output_root = self.ws_output_root
-            args.vis_server = 'http://localhost'
+        args.vis_server = 'http://localhost'
 
         self.assert_version(args.version)
 
