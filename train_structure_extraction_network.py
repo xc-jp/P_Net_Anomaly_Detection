@@ -149,13 +149,12 @@ class RunMyModel(object):
                                                  resize_size=(256, 256), crop_size=(224, 224))
         self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch, shuffle=True,
                                                         num_workers=1, pin_memory=True)
-        if args.valid_label is not None:
-            valid_dataset = ImageDataset(args.valid_label, args.image_root, augment=False,
-                                         resize_size=(256, 256), crop_size=None)
-            self.valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=args.batch, shuffle=False,
-                                                            num_workers=1, pin_memory=True)
-        else:
-            self.valid_loader = None
+        if args.valid_label is None:
+            raise ValueError('Validation label path must be passsed')
+        valid_dataset = ImageDataset(args.valid_label, args.image_root, augment=False,
+                                     resize_size=(256, 256), crop_size=None)
+        self.valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=args.batch, shuffle=False,
+                                                        num_workers=1, pin_memory=True)
 
         print_args(args)
         self.args = args
