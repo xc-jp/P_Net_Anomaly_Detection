@@ -97,7 +97,7 @@ class ImageDataset(torch.utils.data.Dataset):
         """
 
         image_path = self._image_paths[i]
-        image = Image.open(os.path.join(self._image_root, image_path)).convert('RGB')
+        image = Image.open(os.path.join(self._image_root, image_path)).convert('RGB').convert('RGB')
         image = self._transform(image)
         return image, image_path
 
