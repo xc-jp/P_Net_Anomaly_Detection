@@ -224,8 +224,8 @@ class RunMyModel(object):
                     output_source_mask = torch.clamp(output_source_mask[:self.args.vis_batch], 0, 1)
 
                 vim_images = torch.cat([image_source,
-                                        mask_source_gt,
-                                        output_source_mask], dim=0)
+                                        mask_source_gt.expand([-1, 3, -1, -1]),
+                                        output_source_mask].expand([-1, 3, -1, -1]), dim=0)
                 self.vis.images(vim_images, win_name='train', nrow=self.args.vis_batch)
 
             if i + 1 == self.train_loader.__len__():
@@ -259,7 +259,7 @@ class RunMyModel(object):
                         # fundus: {0, 1}, B1WH
                         output_mask = output_mask[:self.args.vis_batch]
 
-                    save_images = torch.cat([image, output_mask], dim=0)
+                    save_images = torch.cat([image, output_mask.expand([-1, 3, -1, -1])], dim=0)
                     output_save = os.path.join(self.args.output_root,
                                                self.args.project,
                                                'output',
@@ -308,7 +308,7 @@ class RunMyModel(object):
                         # fundus: {0, 1}, B1WH
                         output_mask = output_mask[:self.args.vis_batch]
 
-                    save_images = torch.cat([image, output_mask], dim=0)
+                    save_images = torch.cat([image, output_mask.expand([-1, 3, -1, -1])], dim=0)
                     output_save = os.path.join(self.args.output_root,
                                                self.args.project,
                                                'output',
@@ -372,7 +372,7 @@ class RunMyModel(object):
                     _output_mask = output_mask.clamp(0, 1)
                     # raise NotImplementedError('error for fundus mode')
 
-                save_images = torch.cat([image, _output_mask], dim=0)
+                save_images = torch.cat([image, _output_mask.expand([-1, 3, -1, -1])], dim=0)
                 output_save_path = os.path.join('/home/imed/new_disk/workspace/',
                                            self.args.project,
                                            'output',
