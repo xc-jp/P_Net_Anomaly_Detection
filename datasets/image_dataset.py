@@ -146,7 +146,7 @@ class SegmentationImageDataset(torch.utils.data.Dataset):
         """
 
         image_path = self._image_paths[i]
-        image = Image.open(os.path.join(self._image_root, image_path))
+        image = Image.open(os.path.join(self._image_root, image_path)).convert('RGB')
         annotation_path = self._annotation_paths[i]
         if annotation_path == '':
             annotation = Image.new('L', image.size, 0)

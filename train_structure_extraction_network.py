@@ -36,9 +36,9 @@ class SegTransferModel(nn.Module):
 
         # model on gpu
         if self.args.data_modality == 'fundus':
-            model_G = UNet_4mp(n_channels=1, n_classes=1)
+            model_G = UNet_4mp(n_channels=3, n_classes=1)
         else:
-            model_G = UNet_4mp(n_channels=1, n_classes=12)
+            model_G = UNet_4mp(n_channels=3, n_classes=12)
         model_D = Discriminator(in_channels=1)
 
         model_G = nn.DataParallel(model_G).to(device)
