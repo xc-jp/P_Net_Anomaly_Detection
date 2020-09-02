@@ -224,7 +224,7 @@ class RunMyModel(object):
 
                 vim_images = torch.cat([image_source,
                                         mask_source_gt.expand([-1, 3, -1, -1]),
-                                        output_source_mask].expand([-1, 3, -1, -1]), dim=0)
+                                        output_source_mask.expand([-1, 3, -1, -1])], dim=0)
                 self.vis.images(vim_images, win_name='train', nrow=self.args.vis_batch)
 
             if i + 1 == self.train_loader.__len__():
