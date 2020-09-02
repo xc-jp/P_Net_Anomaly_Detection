@@ -131,70 +131,46 @@ class RecAE_5mp(nn.Module):
 
         return x_rec
 
-# TO_Delete
-class Seg_UNet_Rec_AE(nn.Module):
-    def __init__(self, mode, n_channels=1, n_classes=1):
-        super(Seg_UNet_Rec_AE, self).__init__()
-        assert mode in ['seg', 'rec', 'seg_rec'], 'mode error'
-        self.mode = mode
-        self.inc = inconv(n_channels, 64)
-        self.down1 = down(64, 128)
-        self.down2 = down(128, 256)
-        self.down3 = down(256, 512)
-        self.down4 = down(512, 512)
+class Reconstruction_4mp(nn.Module):
+    def __init__(self, image_channels, structure_channels):
+        super(Reconstruction_4mp, self).__init__()
+
+        self.image_inc = inconv(image_channels, 64)
+        self.image_down1 = down(64, 128)
+        self.image_down2 = down(128, 256)
+        self.image_down3 = down(256, 512)
+        self.image_down4 = down(512, 256)
+
+        self.structure_inc = inconv(structure_channels, 64)
+        self.structure_down1 = down(64, 128)
+        self.structure_down2 = down(128, 256)
+        self.structure_down3 = down(256, 512)
+        self.structure_down4 = down(512, 256)
 
         self.up1 = up(1024, 256)
         self.up2 = up(512, 128)
         self.up3 = up(256, 64)
         self.up4 = up(128, 64)
+        self.out = outconv(64, image_channels)
 
-        self.up_ae_1 = up_wo_skip(512, 256)
-        self.up_ae_2 = up_wo_skip(256, 128)
-        self.up_ae_3 = up_wo_skip(128, 64)
-        self.up_ae_4 = up_wo_skip(64, 64)
+    def forward(self, image, structure):
+        image_x = self.image_inc(image)
+        image_x = self.image_down1(image_x)
+        image_x = self.image_down2(image_x)
+        image_x = self.image_down3(image_x)
+        image_x = self.image_down4(image_x)
 
-        self.outc = outconv(64, n_classes)
-        self.outc_ae = outconv(64, n_channels)
+        structure_x1 = self.image_inc(image)
+        structure_x2 = self.image_down1(structure_x1)
+        structure_x3 = self.image_down2(structure_x2)
+        structure_x4 = self.image_down3(structure_x3)
+        structure_x5 = self.image_down4(structure_x4)
 
-    def forward(self, x):
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
+        x = torch.cat([image_x, structure_x5], dim=1)
 
-        if self.mode == 'seg':
-            x_seg = self.up1(x5, x4)
-            x_seg = self.up2(x_seg, x3)
-            x_seg = self.up3(x_seg, x2)
-            x_seg = self.up4(x_seg, x1)
-            x_seg = self.outc(x_seg)
-            return x_seg
-        elif self.mode == 'rec':
-            x_rec = self.up_ae_1(x5)
-            x_rec = self.up_ae_2(x_rec)
-            x_rec = self.up_ae_3(x_rec)
-            x_rec = self.up_ae_4(x_rec)
-            x_rec = self.outc_ae(x_rec)
-            return x_rec
-        else:
-            x_seg = self.up1(x5, x4)
-            x_seg = self.up2(x_seg, x3)
-            x_seg = self.up3(x_seg, x2)
-            x_seg = self.up4(x_seg, x1)
-            x_seg = self.outc(x_seg)
-
-            x_rec = self.up_ae_1(x5)
-            x_rec = self.up_ae_2(x_rec)
-            x_rec = self.up_ae_3(x_rec)
-            x_rec = self.up_ae_4(x_rec)
-            x_rec = self.outc_ae(x_rec)
-            return x_seg, x_rec
-
-
-def main():
-    pass
-
-
-if __name__ == '__main__':
-    main()
+        x = self.up1(x, structure_x4)
+        x = self.up2(x, structure_x3)
+        x = self.up3(x, structure_x2)
+        x = self.up4(x, structure_x1)
+        x = self.out(x)
+        return x

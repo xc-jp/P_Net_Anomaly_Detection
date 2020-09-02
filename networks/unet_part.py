@@ -117,6 +117,30 @@ class up(nn.Module):
         return x
 
 
+class up_with_skip(nn.Module):
+    def __init__(self, in_ch, out_ch, skip_channel, bilinear=True):
+        super(up_with_skip, self).__init__()
+
+        #  would be a nice idea if the upsampling could be learned too,
+        #  but my machine do not have enough memory to handle all those weights
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        else:
+            self.up = nn.ConvTranspose2d(in_ch, skip_channel, 2, stride=2)
+
+        self.conv = double_conv(skip_channel * 2, out_ch)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffX = x1.size()[2] - x2.size()[2]
+        diffY = x1.size()[3] - x2.size()[3]
+        x2 = F.pad(x2, (diffX // 2, int(diffX / 2),
+                        diffY // 2, int(diffY / 2)))
+        x = torch.cat([x2, x1], dim=1)
+        x = self.conv(x)
+        return x
+
+
 class up_wo_skip(nn.Module):
     def __init__(self, in_ch, out_ch, bilinear=True):
         super(up_wo_skip, self).__init__()

@@ -15,6 +15,8 @@ class ParserArgs(object):
         self.parser.add_argument('label_path', help='Training label file path')
         self.parser.add_argument('output_root', help='Output directory path')
         self.parser.add_argument('--valid_label', default=None, help='Validation label file path')
+        self.parser.add_argument('--test_label', default=None, help='Test label file path')
+        self.parser.add_argument('--structure_model', default=None, help='Structure extraction model file path')
         self.constant_init()
         self.get_general_parser()
         self.get_data_parser()

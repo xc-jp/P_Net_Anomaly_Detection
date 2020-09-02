@@ -13,9 +13,10 @@ import torch.nn as nn
 import torch.nn.parallel
 import torch.optim
 
-from dataloader.OCT_DataLoader import OCT_ClsDataloader
-from dataloader.fundus_cls_dataloader import NewClsFundusDataloader
-from networks.P_Net_v1 import Strcutre_Extraction_Network, Image_Reconstruction_Network
+from datasets import SegmentationImageDataset
+from datasets import ImageDataset
+from networks.unet import UNet_4mp
+from networks.unet import Reconstruction_4mp
 from networks.discriminator import Discriminator
 from utils.gan_loss import AdversarialLoss
 from utils.visualizer import Visualizer
@@ -27,6 +28,10 @@ class PNetModel(nn.Module):
     def __init__(self, args, ablation_mode=4):
         super(PNetModel, self).__init__()
         self.args = args
+        if args.gpu >= 0:
+            device = torch.device('cuda', args.gpu)
+        else:
+            device = torch.device('cpu')
 
         """
         ablation study mode
@@ -37,18 +42,19 @@ class PNetModel(nn.Module):
 
         # model on gpu
         if self.args.data_modality == 'fundus':
-            model_G1 = Strcutre_Extraction_Network(n_channels=1, n_classes=1)
+            model_G1 = UNet_4mp(n_channels=3, n_classes=1)
+            model_G2 = Reconstruction_4mp(image_channels=3, structure_channels=1)
         else:
-            model_G1 = Strcutre_Extraction_Network(n_channels=1, n_classes=12)
-        model_G2 = Image_Reconstruction_Network(in_ch=1, modality=self.args.data_modality, ablation_mode=ablation_mode)
-        model_D = Discriminator(in_channels=1)
+            model_G1 = UNet_4mp(n_channels=3, n_classes=12)
+            model_G2 = Reconstruction_4mp(image_channels=3, structure_channels=12)
+        model_D = Discriminator(in_channels=3)
 
-        model_G1 = nn.DataParallel(model_G1).cuda()
-        model_G2 = nn.DataParallel(model_G2).cuda()
-        model_D = nn.DataParallel(model_D).cuda()
+        model_G1 = nn.DataParallel(model_G1).to(device)
+        model_G2 = nn.DataParallel(model_G2).to(device)
+        model_D = nn.DataParallel(model_D).to(device)
 
-        l1_loss = nn.L1Loss().cuda()
-        adversarial_loss = AdversarialLoss().cuda()
+        l1_loss = nn.L1Loss().to(device)
+        adversarial_loss = AdversarialLoss().to(device)
 
         self.add_module('model_G1', model_G1)
         self.add_module('model_G2', model_G2)
@@ -67,35 +73,14 @@ class PNetModel(nn.Module):
                                             weight_decay=args.weight_decay,
                                             betas=(args.b1, args.b2))
 
-        # load 1-st ckpts
-        if self.args.server == 'ai':
-            seg_ckpt_root = os.path.join('/root/workspace', args.project, 'save_models')
-        else:
-            seg_ckpt_root = os.path.join('/home/imed/new_disk/workspace', args.project, 'save_models')
-        if self.args.data_modality == 'fundus':
-            if self.args.DA_ablation_mode_isee == 0:
-                _g_zero_point = '0'
-            elif self.args.DA_ablation_mode_isee == 0.001:
-                _g_zero_point = '001'
-            elif self.args.DA_ablation_mode_isee == 0.0001:
-                # this is the default
-                _g_zero_point = '0001'
-            else:
-                raise NotImplementedError('error')
-
-            seg_ckpt_path = os.path.join(seg_ckpt_root, '1st_fundus_seg_g_{}.pth.tar'.format(_g_zero_point))
-
-            ## orginal seg mdel
-            # seg_ckpt_path = os.path.join(seg_ckpt_root, '1st_fundus_seg_vgg.pth.tar')
-        else:
-            seg_ckpt_path = os.path.join(seg_ckpt_root, '1st_oct_seg.pth.tar')
-
+        # load structure extraction network parameters
+        seg_ckpt_path = args.structure_model
         if os.path.isfile(seg_ckpt_path):
             print("=> loading G1 checkpoint")
             checkpoint = torch.load(seg_ckpt_path)
             self.model_G1.load_state_dict(checkpoint['state_dict_G'])
             print("=> loaded G1 checkpoint (epoch {}) \n from {}"
-                  .format(checkpoint['epoch'], seg_ckpt_path))
+                .format(checkpoint['epoch'], seg_ckpt_path))
         else:
             raise ValueError("=> no checkpoint found at '{}'".format(seg_ckpt_path))
 
@@ -137,24 +122,24 @@ class PNetModel(nn.Module):
         dis_fake, dis_fake_feat = self.model_D(dis_input_fake)
         dis_real_loss = self.adversarial_loss(dis_real, True, True)
         dis_fake_loss = self.adversarial_loss(dis_fake, False, True)
-        dis_loss += (dis_real_loss + dis_fake_loss) / 2
+        dis_loss = dis_loss + (dis_real_loss + dis_fake_loss) / 2
 
         # generator adversarial loss
         gen_input_fake = fake_B
         gen_fake, gen_fake_feat = self.model_D(gen_input_fake)
         gen_gan_loss = self.adversarial_loss(gen_fake, True, False) * self.args.lamd_gen
-        gen_loss += gen_gan_loss
+        gen_loss = gen_loss + gen_gan_loss
 
         # generator feature matching loss
         gen_fm_loss = 0
         for i in range(len(dis_real_feat)):
-            gen_fm_loss += self.l1_loss(gen_fake_feat[i], dis_real_feat[i].detach())
+            gen_fm_loss = gen_fm_loss + self.l1_loss(gen_fake_feat[i], dis_real_feat[i].detach())
         gen_fm_loss = gen_fm_loss * self.args.lamd_fm
-        gen_loss += gen_fm_loss
+        gen_loss = gen_loss + gen_fm_loss
 
         # generator l1 loss
         gen_l1_loss = self.l1_loss(fake_B, real_B) * self.args.lamd_p
-        gen_loss += gen_l1_loss
+        gen_loss = gen_loss + gen_l1_loss
 
         # create logs
         logs = dict(
@@ -169,50 +154,41 @@ class PNetModel(nn.Module):
 
     def forward(self, image):
         with torch.no_grad():
-            seg_mask, seg_structure_feat, seg_latent_feat = self.model_G1(image)
-        image_rec = self.model_G2(image, seg_mask, seg_latent_feat)
+            seg_mask = self.model_G1(image)
+        image_rec = self.model_G2(image, seg_mask)
 
         return seg_mask, image_rec
 
     def backward(self, gen_loss=None, dis_loss=None):
         if dis_loss is not None:
             dis_loss.backward()
-        self.optimizer_D.step()
-
         if gen_loss is not None:
             gen_loss.backward()
+        self.optimizer_D.step()
         self.optimizer_G.step()
 
 
 class RunMyModel(object):
     def __init__(self):
         args = ParserArgs().get_args()
-        cuda_visible(args.gpu)
-
-        cudnn.benchmark = True
+        if args.gpu >= 0:
+            self.device = torch.device('cuda', args.gpu)
+            cudnn.benchmark = True
+        else:
+            self.device = torch.device('cpu')
 
         self.vis = Visualizer(env='{}'.format(args.version), port=args.port, server=args.vis_server)
 
-        if args.data_modality == 'fundus':
-            # IDRiD dataset for segmentation
-            # image, mask, image_name_item
+        # TODO pass resize and crop size
+        train_dataset = ImageDataset(args.label_path, args.image_root, augment=True, resize_size=(256, 256),
+                                     crop_size=(224, 224))
+        self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch, shuffle=True,
+                                                        num_workers=1, pin_memory=True)
 
-            # iSee dataset for classification
-            # image, image_name
-            self.train_loader, self.normal_test_loader, \
-            self.amd_fundus_loader, self.myopia_fundus_loader, \
-            self.glaucoma_fundus_loader, self.dr_fundus_loader = \
-                NewClsFundusDataloader(data_root=self.args.isee_fundus_root,
-                                       batch=self.args.batch,
-                                       scale=self.args.scale).data_load()
-
-        else:
-            # Challenge OCT dataset for classification
-            # image, [case_name, image_name]
-            self.train_loader, self.normal_test_loader, self.oct_abnormal_loader = OCT_ClsDataloader(
-                                                    data_root=args.challenge_oct,
-                                                       batch=args.batch,
-                                                       scale=args.scale).data_load()
+        test_dataset = ImageDataset(args.test_label, args.image_root, augment=False, resize_size=(256, 256),
+                                    crop_size=None)
+        self.test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch, shuffle=False,
+                                                       num_workers=1, pin_memory=True)
 
         print_args(args)
         self.args = args
@@ -252,13 +228,11 @@ class RunMyModel(object):
             self.epoch = epoch
             self.train()
             # last 80 epoch, validate with freq
-            if epoch > self.args.validate_start_epoch \
-                    and (epoch % self.args.validate_freq == 0
-                         or epoch > (self.args.n_epochs - self.args.validate_each_epoch)):
+            if epoch > self.args.validate_start_epoch and (epoch % self.args.validate_freq == 0
+               or epoch > (self.args.n_epochs - self.args.validate_each_epoch)):
                 self.validate_cls()
 
             print('\n', '*' * 10, 'Program Information', '*' * 10)
-            print('Node: {}'.format(self.args.node))
             print('GPU: {}'.format(self.args.gpu))
             print('Version: {}\n'.format(self.args.version))
 
@@ -268,7 +242,7 @@ class RunMyModel(object):
         train_loader = self.train_loader
 
         for i, (image, _,) in enumerate(train_loader):
-            image = image.cuda(non_blocking=True)
+            image = image.to(self.device)
 
             # train
             seg_mask, image_rec, gen_loss, dis_loss, logs = \
@@ -311,7 +285,7 @@ class RunMyModel(object):
                 image_rec = image_rec[:self.args.vis_batch].clamp(0, 1)
                 image_diff = torch.abs(image-image_rec)
 
-                vim_images = torch.cat([image, seg_mask, image_rec, image_diff], dim=0)
+                vim_images = torch.cat([image, seg_mask.expand([-1, 3, -1, -1]), image_rec, image_diff], dim=0)
                 self.vis.images(vim_images, win_name='train', nrow=self.args.vis_batch)
 
                 output_save = os.path.join(self.args.output_root,
@@ -335,167 +309,6 @@ class RunMyModel(object):
                                          win='gen_loss')
 
     def validate_cls(self):
-        # self.model.eval()
-        self.model.train()
-
-        with torch.no_grad():
-            """
-            Difference: abnormal dataloader and abnormal_list
-            """
-            if self.args.data_modality == 'fundus':
-                myopia_gt_list, myopia_pred_list = self.forward_cls_dataloader(
-                    loader=self.myopia_fundus_loader, is_disease=True)
-
-                amd_gt_list, amd_pred_list = self.forward_cls_dataloader(
-                    loader=self.amd_fundus_loader, is_disease=True
-                )
-                glaucoma_gt_list, glaucoma_pred_list = self.forward_cls_dataloader(
-                    loader=self.glaucoma_fundus_loader, is_disease=True
-                )
-                dr_gt_list, dr_pred_list = self.forward_cls_dataloader(
-                    loader=self.dr_fundus_loader, is_disease=True
-                )
-            else:
-                abnormal_gt_list, abnormal_pred_list = self.forward_cls_dataloader(
-                    loader=self.oct_abnormal_loader, is_disease=True)
-
-            _, normal_train_pred_list = self.forward_cls_dataloader(
-                loader=self.train_loader, is_disease=False
-            )
-            normal_gt_list, normal_pred_list = self.forward_cls_dataloader(
-                loader=self.normal_test_loader, is_disease=False)
-
-            """
-            computer metrics
-            """
-            # Difference: total_true_list and total_pred_list
-            if self.args.data_modality == 'fundus':
-                # test metrics for myopia
-                m_true_list = myopia_gt_list + normal_gt_list
-                m_pred_list = myopia_pred_list + normal_pred_list
-                # test metrics for amd
-                a_true_list = amd_gt_list + normal_gt_list
-                a_pred_list = amd_pred_list + normal_pred_list
-                # test metrics for glaucoma
-                g_true_list = glaucoma_gt_list + normal_gt_list
-                g_pred_list = glaucoma_pred_list + normal_pred_list
-                # test metrics for amd
-                d_true_list = dr_gt_list + normal_gt_list
-                d_pred_list = dr_pred_list + normal_pred_list
-                # total
-                total_true_list = a_true_list + myopia_gt_list + glaucoma_gt_list + dr_gt_list
-                total_pred_list = a_pred_list + myopia_pred_list + glaucoma_pred_list + dr_pred_list
-
-                # fpr, tpr, thresholds = metrics.roc_curve()
-                myopia_auc = metrics.roc_auc_score(np.array(m_true_list), np.array(m_pred_list))
-                amd_auc = metrics.roc_auc_score(np.array(a_true_list), np.array(a_pred_list))
-                glaucoma_auc = metrics.roc_auc_score(np.array(g_true_list), np.array(g_pred_list))
-                dr_auc = metrics.roc_auc_score(np.array(d_true_list), np.array(d_pred_list))
-            else:
-                total_true_list = abnormal_gt_list + normal_gt_list
-                total_pred_list = abnormal_pred_list + normal_pred_list
-
-            # get roc curve and compute the auc
-            fpr, tpr, thresholds = metrics.roc_curve(np.array(total_true_list), np.array(total_pred_list))
-            total_auc = metrics.auc(fpr, tpr)
-
-            """
-            compute thereshold, and then compute the accuracy
-            """
-            percentage = 0.75
-            _threshold_for_acc = sorted(normal_train_pred_list)[int(len(normal_train_pred_list) * percentage)]
-            normal_cls_pred_list = [(0 if i < _threshold_for_acc else 1) for i in normal_pred_list]
-            amd_cls_pred_list = [(0 if i < _threshold_for_acc else 1) for i in amd_pred_list]
-            myopia_cls_pred_list = [(0 if i < _threshold_for_acc else 1) for i in myopia_pred_list]
-            glaucoma_cls_pred_list = [(0 if i < _threshold_for_acc else 1) for i in glaucoma_pred_list]
-            dr_cls_pred_list = [(0 if i < _threshold_for_acc else 1) for i in dr_pred_list]
-
-            # acc, sensitivity and specifity
-            def calcu_cls_acc(pred_list, gt_list):
-                cls_pred_list = normal_cls_pred_list + pred_list
-                gt_list = normal_gt_list + gt_list
-                acc = metrics.accuracy_score(y_true=gt_list, y_pred=cls_pred_list)
-                tn, fp, fn, tp = metrics.confusion_matrix(y_true=gt_list, y_pred=cls_pred_list).ravel()
-                sen = tp / (tp + fn + 1e-7)
-                spe = tn / (tn + fp + 1e-7)
-                return acc, sen, spe
-
-            total_acc, total_sen, total_spe = calcu_cls_acc(
-                amd_cls_pred_list + myopia_cls_pred_list, amd_gt_list + myopia_gt_list)
-            amd_acc, amd_sen, amd_spe = calcu_cls_acc(amd_cls_pred_list, amd_gt_list)
-            myopia_acc, myopia_sen, myopia_spe = calcu_cls_acc(myopia_cls_pred_list, myopia_gt_list)
-
-            # update
-            if self.args.data_modality:
-                self.myopia_auc_last20.update(myopia_auc)
-                self.amd_auc_last20.update(amd_auc)
-
-            self.total_auc_last20.update(total_auc)
-            mean, deviation = self.total_auc_top10.top_update_calc(total_auc)
-
-            self.is_best = total_auc > self.best_auc
-            self.best_auc = max(total_auc, self.best_auc)
-
-            """
-            plot metrics curve
-            """
-            # ROC curve
-            self.vis.draw_roc(fpr, tpr)
-            # total auc, primary metrics
-            self.vis.plot_single_win(dict(value=total_auc,
-                                          best=self.best_auc,
-                                          last_avg=self.total_auc_last20.avg,
-                                          last_std=self.total_auc_last20.std,
-                                          top_avg=mean,
-                                          top_dev=deviation), win='total_auc')
-
-            self.vis.plot_single_win(dict(
-                total_acc=total_acc,
-                total_sen=total_sen,
-                total_spe=total_spe,
-                amd_acc=amd_acc,
-                amd_sen=amd_sen,
-                amd_spe=amd_spe,
-                myopia_acc=myopia_acc,
-                myopia_sen=myopia_sen,
-                myopia_spe=myopia_spe
-            ), win='accuracy')
-
-            # Difference
-            if self.args.data_modality == 'fundus':
-                self.vis.plot_single_win(dict(value=amd_auc,
-                                              last_avg=self.amd_auc_last20.avg,
-                                              last_std=self.amd_auc_last20.std), win='amd_auc')
-                self.vis.plot_single_win(dict(value=myopia_auc,
-                                              last_avg=self.myopia_auc_last20.avg,
-                                              last_std=self.myopia_auc_last20.std), win='myopia_auc')
-
-                metrics_str = 'best_auc = {:.4f},' \
-                              'total_avg = {:.4f}, total_std = {:.4f}, ' \
-                              'total_top_avg = {:.4f}, total_top_dev = {:.4f}, ' \
-                              'amd_avg = {:.4f}, amd_std = {:.4f}, ' \
-                              'myopia_avg = {:.4f}, myopia_std ={:.4f}'.format(self.best_auc,
-                                       self.total_auc_last20.avg, self.total_auc_last20.std,
-                                       mean, deviation,
-                                       self.amd_auc_last20.avg, self.amd_auc_last20.std,
-                                       self.myopia_auc_last20.avg, self.myopia_auc_last20.std)
-                metrics_acc_str = '\n total_acc = {:.4f}, total_sen = {:.4f}, total_spe = {:.4f}, ' \
-                                  'amd_acc = {:.4f}, amd_sen = {:.4f}, amd_spe = {:.4f}, ' \
-                                  'myopia_acc = {:.4f}, myopia_sen = {:.4f}, myopia_spe = {:.4f}'\
-                    .format(total_acc, total_sen, total_spe, amd_acc, amd_sen,
-                            amd_spe, myopia_acc, myopia_sen, myopia_spe)
-
-            else:
-                metrics_str = 'best_auc = {:.4f},' \
-                              'total_avg = {:.4f}, total_std = {:.4f}, ' \
-                              'total_top_avg = {:.4f}, total_top_dev = {:.4f}'.format(self.best_auc,
-                                      self.total_auc_last20.avg,
-                                      self.total_auc_last20.std,
-                                      mean, deviation)
-                metrics_acc_str = '\n None'
-
-            self.vis.text(metrics_str + metrics_acc_str)
-
         save_ckpt(version=self.args.version,
                   state={
                       'epoch': self.epoch,
@@ -503,87 +316,41 @@ class RunMyModel(object):
                       'state_dict_D': self.model.model_D.state_dict(),
                   },
                   epoch=self.epoch,
-                  is_best=self.is_best,
                   args=self.args)
-
         print('\n Save ckpt successfully!')
-        print('\n', metrics_str + metrics_acc_str)
 
     def test_acc(self):
         self.model.train()
 
         with torch.no_grad():
-            """
-            Difference: abnormal dataloader and abnormal_list
-            """
-            _, normal_train_pred_list = self.forward_cls_dataloader(
-                loader=self.train_loader, is_disease=False
-            )
-
-            if self.args.data_modality == 'fundus':
-                myopia_gt_list, myopia_pred_list = self.forward_cls_dataloader(
-                    loader=self.myopia_fundus_loader, is_disease=True)
-
-                amd_gt_list, amd_pred_list = self.forward_cls_dataloader(
-                    loader=self.amd_fundus_loader, is_disease=True
-                )
-            else:
-                abnormal_gt_list, abnormal_pred_list = self.forward_cls_dataloader(
-                    loader=self.oct_abnormal_loader, is_disease=True)
-
-            normal_gt_list, normal_pred_list = self.forward_cls_dataloader(
-                loader=self.normal_test_loader, is_disease=False)
+            _, train_predictions = self.forward_cls_dataloader(loader=self.train_loader)
+            ground_truths, predictions = self.forward_cls_dataloader(loader=self.test_loader)
 
             """
             compute metrics
             """
-            # Difference: total_true_list and total_pred_list
-            if self.args.data_modality == 'fundus':
-                # test metrics for amd
-                amd_auc_true_list = amd_gt_list + normal_gt_list
-                amd_auc_pred_list = amd_pred_list + normal_pred_list
-                # myopia
-                myopia_auc_true_list = myopia_gt_list + normal_gt_list
-                myopia_auc_pred_list = myopia_pred_list + normal_pred_list
-                # total
-                total_true_list = amd_auc_true_list + myopia_gt_list
-                total_pred_list = amd_auc_pred_list + myopia_pred_list
-
-                # fpr, tpr, thresholds = metrics.roc_curve()
-                myopia_auc = metrics.roc_auc_score(np.array(myopia_auc_true_list), np.array(myopia_auc_pred_list))
-                amd_auc = metrics.roc_auc_score(np.array(amd_auc_true_list), np.array(amd_auc_pred_list))
-
-            else:
-                total_true_list = abnormal_gt_list + normal_gt_list
-                total_pred_list = abnormal_pred_list + normal_pred_list
-
             # get roc curve and compute the auc
-            fpr, tpr, thresholds = metrics.roc_curve(np.array(total_true_list), np.array(total_pred_list))
+            fpr, tpr, thresholds = metrics.roc_curve(np.array(ground_truths), np.array(predictions))
             total_auc = metrics.auc(fpr, tpr)
 
             """
             compute thereshold, and then compute the accuracy of AMD and Myopia
             """
             percentage = 0.75
-            _threshold_for_acc = sorted(normal_train_pred_list)[int(len(normal_train_pred_list) * percentage)]
-
-            normal_cls_pred_list = [(0 if i < _threshold_for_acc else 1) for i in normal_pred_list]
-            amd_cls_pred_list = [(0 if i < _threshold_for_acc else 1) for i in amd_pred_list]
-            myopia_cls_pred_list = [(0 if i < _threshold_for_acc else 1) for i in myopia_pred_list]
+            accuracy_threshold = sorted(train_predictions)[int(len(train_predictions) * percentage)]
+            class_predictions = [0 if prediction < accuracy_threshold else 1 for prediction in predictions]
 
             # acc, sensitivity and specifity
-            def calcu_cls_acc(pred_list, gt_list):
+            def calculate_class_accuracy(predictions, ground_truths):
                 cls_pred_list = normal_cls_pred_list + pred_list
                 gt_list = normal_gt_list + gt_list
-                acc = metrics.accuracy_score(y_true=gt_list, y_pred=cls_pred_list)
-                tn, fp, fn, tp = metrics.confusion_matrix(y_true=gt_list, y_pred=cls_pred_list).ravel()
-                sen = tp / (tp + fn + 1e-7)
-                spe = tn / (tn + fp + 1e-7)
-                return acc, sen, spe
+                accuracy = metrics.accuracy_score(y_true=ground_truths, y_pred=predictions)
+                tn, fp, fn, tp = metrics.confusion_matrix(y_true=ground_truths, y_pred=predictions).ravel()
+                precision = tp / (tp + fp + 1e-7)
+                recall = tp / (tp + fn + 1e-7)
+                return accuracy, precision, recall
 
-            amd_acc, amd_sen, amd_spe = calcu_cls_acc(amd_cls_pred_list, amd_gt_list)
-            myopia_acc, myopia_sen, myopia_spe = calcu_cls_acc(myopia_cls_pred_list, myopia_gt_list)
-
+            accuracy, precision, recall = calculate_class_accuracy(predictions, ground_truths)
 
             """
             plot metrics curve
@@ -591,21 +358,19 @@ class RunMyModel(object):
             # ROC curve
             self.vis.draw_roc(fpr, tpr)
 
-            metrics_auc_str = 'AUC = {:.4f}, AMD AUC = {:.4f}, Myopia AUC = {:.4f}'.\
-                format(total_auc, amd_auc, myopia_auc)
-            metrics_amd_acc_str = '\n amd_acc = {:.4f}, amd_sen = {:.4f}, amd_spe = {:.4f}'.\
-                format(amd_acc, amd_sen, amd_spe)
-            metrics_myopia_acc_str = '\n myopia_acc = {:.4f}, myopia_sen = {:.4f}, myopia_spe = {:.4f}'.\
-                format(myopia_acc,  myopia_sen, myopia_spe)
+            metrics_str = 'AUC = {:.4f}, Accuracy = {:.4f}, Precision = {:.4f}, Recall = {:.4f}'.format(total_auc, accuracy, precision, recall)
+            self.vis.text(metrics_str)
+            print(metrics_str)
 
-            self.vis.text(metrics_auc_str + metrics_amd_acc_str + metrics_myopia_acc_str)
-            print(metrics_auc_str + metrics_amd_acc_str + metrics_myopia_acc_str)
-
-    def forward_cls_dataloader(self, loader, is_disease):
+    def forward_cls_dataloader(self, loader):
+        if self.args.gpu >= 0:
+            device = torch.device('cuda', self.args.gpu)
+        else:
+            device = torch.device('cpu')
         gt_list = []
         pred_list = []
-        for i, (image, image_name_item) in enumerate(loader):
-            image = image.cuda(non_blocking=True)
+        for i, (image, annotation, image_name) in enumerate(loader):
+            image = image.to(device)
             # val, forward
             seg_mask, image_rec = self.model(image)
 
@@ -623,9 +388,9 @@ class RunMyModel(object):
             image_diff_mae = image_residual.mean(dim=3).mean(dim=2).mean(dim=1)
 
             # image: tensor
-            # image_name: list
-            # image_name.shape[0]: batch
-            gt_list += [1 if is_disease else 0] * len(image_name)
+            annotation = annotation.detach().to('cpu').numpy()
+            annotation = annotation.reshape((annotation.shape[0], -1))
+            gt_list += np.any(annotation >= 0.5, axis=1).astype(np.int32).tolist()
             pred_list += image_diff_mae.tolist()
 
             """
@@ -645,23 +410,18 @@ class RunMyModel(object):
                     seg_mask = torch.argmax(seg_mask[:self.args.vis_batch], dim=1).float()
                     seg_mask = (seg_mask.unsqueeze(dim=1) / 11).clamp(0, 1)
 
-                vim_images = torch.cat([image, seg_mask, image_rec, image_diff], dim=0)
+                vim_images = torch.cat([image, seg_mask.expand([-1, 3, -1, -1]), image_rec, image_diff], dim=0)
 
                 self.vis.images(vim_images, win_name='val', nrow=self.args.vis_batch)
 
                 """
                 save images
                 """
-                output_save = os.path.join(self.args.output_root,
-                                           self.args.project,
-                                           'output_v1_0812',
-                                           '{}'.format(self.args.version),
-                                           'val')
-
+                save_path = os.path.join(self.args.output_root, self.args.project, '{}'.format(self.args.version),
+                                         'val', '{}.png'.format(i))
                 if not os.path.exists(output_save):
                     os.makedirs(output_save)
-                tv.utils.save_image(vim_images, os.path.join(
-                    output_save, '{}_{}.png'.format(case_name[0], image_name[0])), nrow=self.args.vis_batch)
+                tv.utils.save_image(vim_images, os.path.join(save_path, '{}.png'.format(i), nrow=self.args.vis_batch))
 
         return gt_list, pred_list
 
@@ -669,9 +429,11 @@ class RunMyModel(object):
 class MultiTestForFigures(object):
     def __init__(self):
         args = ParserArgs().args
-        cuda_visible(args.gpu)
-
-        cudnn.benchmark = True
+        if args.gpu >= 0:
+            self.device = torch.device('cuda', args.gpu)
+            cudnn.benchmark = True
+        else:
+            self.device = torch.device('cpu')
 
         if args.data_modality == 'fundus':
             # IDRiD dataset for segmentation
@@ -730,7 +492,7 @@ class MultiTestForFigures(object):
 
     def forward_cls_dataloader(self, loader, ablation_mode, original_flag):
         for i, (image, image_name_item) in enumerate(loader):
-            image = image.cuda(non_blocking=True)
+            image = image.to(self.device)
             # val, forward
             seg_mask, image_rec = self.model(image)
 
