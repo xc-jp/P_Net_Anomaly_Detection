@@ -147,10 +147,10 @@ class Reconstruction_4mp(nn.Module):
         self.structure_down3 = down(256, 512)
         self.structure_down4 = down(512, 256)
 
-        self.up1 = up(1024, 256)
-        self.up2 = up(512, 128)
-        self.up3 = up(256, 64)
-        self.up4 = up(128, 64)
+        self.up1 = up(1024, 256, bilinear=False)
+        self.up2 = up(512, 128, bilinear=False)
+        self.up3 = up(256, 64, bilinear=False)
+        self.up4 = up(128, 64, bilinear=False)
         self.out = outconv(64, image_channels)
 
     def forward(self, image, structure):
@@ -160,11 +160,11 @@ class Reconstruction_4mp(nn.Module):
         image_x = self.image_down3(image_x)
         image_x = self.image_down4(image_x)
 
-        structure_x1 = self.image_inc(image)
-        structure_x2 = self.image_down1(structure_x1)
-        structure_x3 = self.image_down2(structure_x2)
-        structure_x4 = self.image_down3(structure_x3)
-        structure_x5 = self.image_down4(structure_x4)
+        structure_x1 = self.structure_inc(structure)
+        structure_x2 = self.structure_down1(structure_x1)
+        structure_x3 = self.structure_down2(structure_x2)
+        structure_x4 = self.structure_down3(structure_x3)
+        structure_x5 = self.structure_down4(structure_x4)
 
         x = torch.cat([image_x, structure_x5], dim=1)
 

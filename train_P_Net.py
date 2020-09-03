@@ -86,8 +86,7 @@ class PNetModel(nn.Module):
 
         # Optionally resume from a checkpoint
         if self.args.resume:
-            ckpt_root = os.path.join(self.args.output_root, args.project, 'checkpoints')
-            ckpt_path = os.path.join(ckpt_root, args.resume)
+            ckpt_path = args.resume
             if os.path.isfile(ckpt_path):
                 print("=> loading G2 checkpoint '{}'".format(args.resume))
                 checkpoint = torch.load(ckpt_path)
@@ -100,7 +99,7 @@ class PNetModel(nn.Module):
 
     def process(self, image):
         # process_outputs
-        seg_mask, image_rec = self(image)
+        seg_mask, image_rec, seg_mask_rec = self(image)
 
         """
         G and D process, this package is reusable
@@ -140,12 +139,15 @@ class PNetModel(nn.Module):
         # generator l1 loss
         gen_l1_loss = self.l1_loss(fake_B, real_B) * self.args.lamd_p
         gen_loss = gen_loss + gen_l1_loss
+        seg_l1_loss = self.l1_loss(seg_mask_rec, seg_mask) * self.args.lamd_p * 0.5
+        gen_loss = gen_loss + seg_l1_loss
 
         # create logs
         logs = dict(
             gen_gan_loss=gen_gan_loss,
             gen_fm_loss=gen_fm_loss,
             gen_l1_loss=gen_l1_loss,
+            seg_l1_loss=seg_l1_loss,
             # gen_content_loss=gen_content_loss,
             # gen_style_loss=gen_style_loss,
         )
@@ -156,15 +158,16 @@ class PNetModel(nn.Module):
         with torch.no_grad():
             seg_mask = self.model_G1(image)
         image_rec = self.model_G2(image, seg_mask)
+        seg_mask_rec = self.model_G1(image_rec)
 
-        return seg_mask, image_rec
+        return seg_mask, image_rec, seg_mask_rec
 
     def backward(self, gen_loss=None, dis_loss=None):
         if dis_loss is not None:
             dis_loss.backward()
+        self.optimizer_D.step()
         if gen_loss is not None:
             gen_loss.backward()
-        self.optimizer_D.step()
         self.optimizer_G.step()
 
 
@@ -185,8 +188,8 @@ class RunMyModel(object):
         self.train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch, shuffle=True,
                                                         num_workers=1, pin_memory=True)
 
-        test_dataset = ImageDataset(args.test_label, args.image_root, augment=False, resize_size=(256, 256),
-                                    crop_size=None)
+        test_dataset = SegmentationImageDataset(args.test_label, args.image_root, augment=False,
+                                                resize_size=(256, 256), crop_size=None)
         self.test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch, shuffle=False,
                                                        num_workers=1, pin_memory=True)
 
@@ -304,8 +307,10 @@ class RunMyModel(object):
                                               gen_l1_loss=logs['gen_l1_loss'].item(),
                                               gen_fm_loss=logs['gen_fm_loss'].item(),
                                               gen_gan_loss=logs['gen_gan_loss'].item(),
-                                              gen_content_loss=logs['gen_content_loss'].item(),
-                                              gen_style_loss=logs['gen_style_loss'].item()),
+                                              seg_l1_loss=logs['seg_l1_loss'].item(),
+                                              # gen_content_loss=logs['gen_content_loss'].item(),
+                                              # gen_style_loss=logs['gen_style_loss'].item()
+                                             ),
                                          win='gen_loss')
 
     def validate_cls(self):
@@ -338,19 +343,25 @@ class RunMyModel(object):
             """
             percentage = 0.75
             accuracy_threshold = sorted(train_predictions)[int(len(train_predictions) * percentage)]
+            ##
+            print('threshold', accuracy_threshold)
+            print(predictions)
+            ##
             class_predictions = [0 if prediction < accuracy_threshold else 1 for prediction in predictions]
 
             # acc, sensitivity and specifity
             def calculate_class_accuracy(predictions, ground_truths):
-                cls_pred_list = normal_cls_pred_list + pred_list
-                gt_list = normal_gt_list + gt_list
+                ##
+                print(ground_truths)
+                print(predictions)
+                ##
                 accuracy = metrics.accuracy_score(y_true=ground_truths, y_pred=predictions)
                 tn, fp, fn, tp = metrics.confusion_matrix(y_true=ground_truths, y_pred=predictions).ravel()
                 precision = tp / (tp + fp + 1e-7)
                 recall = tp / (tp + fn + 1e-7)
                 return accuracy, precision, recall
 
-            accuracy, precision, recall = calculate_class_accuracy(predictions, ground_truths)
+            accuracy, precision, recall = calculate_class_accuracy(class_predictions, ground_truths)
 
             """
             plot metrics curve
@@ -369,16 +380,15 @@ class RunMyModel(object):
             device = torch.device('cpu')
         gt_list = []
         pred_list = []
-        for i, (image, annotation, image_name) in enumerate(loader):
+        for i, items in enumerate(loader):
+            if len(items) == 2:
+                image, image_name = items
+                annotation = None
+            else:
+                image, annotation, image_name = items
             image = image.to(device)
             # val, forward
-            seg_mask, image_rec = self.model(image)
-
-            if self.args.data_modality == 'fundus':
-                case_name = ['']
-                image_name = image_name_item
-            else:
-                case_name, image_name = image_name_item
+            seg_mask, image_rec, seg_mask_rec = self.model(image)
 
             """
             preditction
@@ -386,12 +396,18 @@ class RunMyModel(object):
             # BCWH -> B, anomaly score
             image_residual = torch.abs(image_rec - image)
             image_diff_mae = image_residual.mean(dim=3).mean(dim=2).mean(dim=1)
+            seg_residual = torch.abs(seg_mask_rec - seg_mask)
+            seg_mask_mae = seg_residual.mean(dim=3).mean(dim=2).mean(dim=1)
 
             # image: tensor
-            annotation = annotation.detach().to('cpu').numpy()
-            annotation = annotation.reshape((annotation.shape[0], -1))
-            gt_list += np.any(annotation >= 0.5, axis=1).astype(np.int32).tolist()
-            pred_list += image_diff_mae.tolist()
+            if annotation is None:
+                gt_list += [0] * len(image)
+            else:
+                annotation = annotation.detach().to('cpu').numpy()
+                annotation = annotation.reshape((annotation.shape[0], -1))
+                gt_list += np.any(annotation >= 0.5, axis=1).astype(np.int32).tolist()
+            image_weight = 0.8
+            pred_list += (image_diff_mae * image_weight + seg_mask_mae * (1 - image_weight)).tolist()
 
             """
             visdom
@@ -399,7 +415,7 @@ class RunMyModel(object):
             if i % self.args.vis_freq_inval == 0:
                 image = image[:self.args.vis_batch]
                 image_rec = image_rec[:self.args.vis_batch].clamp(0, 1)
-                image_diff = torch.abs(image - image_rec)
+                image_diff = torch.abs(image - image_rec) * 10
 
                 """
                 Difference: seg_mask is different between fundus and oct images
@@ -410,18 +426,20 @@ class RunMyModel(object):
                     seg_mask = torch.argmax(seg_mask[:self.args.vis_batch], dim=1).float()
                     seg_mask = (seg_mask.unsqueeze(dim=1) / 11).clamp(0, 1)
 
-                vim_images = torch.cat([image, seg_mask.expand([-1, 3, -1, -1]), image_rec, image_diff], dim=0)
+                vim_images = torch.cat([image, seg_mask.expand([-1, 3, -1, -1]), image_rec, seg_mask_rec.expand([-1, 3, -1, -1]), image_diff], dim=0)
 
                 self.vis.images(vim_images, win_name='val', nrow=self.args.vis_batch)
 
                 """
                 save images
                 """
+                save_name = os.path.splitext(image_name[0])[0]
                 save_path = os.path.join(self.args.output_root, self.args.project, '{}'.format(self.args.version),
-                                         'val', '{}.png'.format(i))
-                if not os.path.exists(output_save):
-                    os.makedirs(output_save)
-                tv.utils.save_image(vim_images, os.path.join(save_path, '{}.png'.format(i), nrow=self.args.vis_batch))
+                                         'val', '{}.png'.format(save_name))
+                save_dir = os.path.dirname(save_path)
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+                tv.utils.save_image(vim_images, save_path, nrow=self.args.vis_batch)
 
         return gt_list, pred_list
 
@@ -449,7 +467,6 @@ class MultiTestForFigures(object):
 
         else:
             # Challenge OCT dataset for classification
-            # image, [case_name, image_name]
             self.train_loader, self.normal_test_loader, self.oct_abnormal_loader = OCT_ClsDataloader(
                                                     data_root=args.challenge_oct,
                                                        batch=args.batch,
@@ -494,7 +511,7 @@ class MultiTestForFigures(object):
         for i, (image, image_name_item) in enumerate(loader):
             image = image.to(self.device)
             # val, forward
-            seg_mask, image_rec = self.model(image)
+            seg_mask, image_rec, seg_mask_rec = self.model(image)
 
             image_name = image_name_item
 
